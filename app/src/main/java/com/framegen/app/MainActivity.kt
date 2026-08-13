@@ -84,9 +84,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var switchThermal: Switch
 
     private var statsJob: Job? = null
+    private var compatibilityJob: Job? = null
     private var isActive = false
     private var selectedPackage: String? = null
     private var selectedAppName: String? = null
+    private var startupChecksScheduled = false
+    private var restoringPrefs = false
 
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -98,37 +101,56 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // Keep the first frame lightweight. Device and Shizuku checks are
+        // deferred so a slow or unavailable binder cannot block app launch.
         initViews()
         setupListeners()
-        detectDeviceInfo()
-        checkCompatibility()
         loadPrefs()
         updateUI()
 
-        // Register receiver
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(stateReceiver, IntentFilter("com.framegen.app.STATE_CHANGED"),
-                RECEIVER_NOT_EXPORTED)
+            registerReceiver(
+                stateReceiver,
+                IntentFilter("com.framegen.app.STATE_CHANGED"),
+                RECEIVER_NOT_EXPORTED
+            )
         } else {
             registerReceiver(stateReceiver, IntentFilter("com.framegen.app.STATE_CHANGED"))
         }
+
+        window.decorView.post { scheduleStartupChecks() }
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        compatibilityJob?.cancel()
         statsJob?.cancel()
         try { unregisterReceiver(stateReceiver) } catch (_: Exception) {}
+        super.onDestroy()
     }
 
     override fun onResume() {
         super.onResume()
-        checkCompatibility()
         updateUI()
+        if (startupChecksScheduled) checkCompatibility()
     }
 
     // ================================================================
     // Init
     // ================================================================
+
+    private fun scheduleStartupChecks() {
+        if (startupChecksScheduled) return
+        startupChecksScheduled = true
+
+        lifecycleScope.launch {
+            // Let Android draw the dashboard before any diagnostic work starts.
+            delay(250)
+            if (!isFinishing && !isDestroyed) {
+                detectDeviceInfo()
+                checkCompatibility()
+            }
+        }
+    }
 
     private fun initViews() {
         txtGpuName = findViewById(R.id.txtGpuName)
@@ -240,6 +262,8 @@ class MainActivity : AppCompatActivity() {
 
         // Force refresh rate
         switchForceRefresh.setOnCheckedChangeListener { _, isChecked ->
+            if (restoringPrefs) return@setOnCheckedChangeListener
+
             if (isChecked) {
                 val rrc = RefreshRateController(this)
                 rrc.requestMaxRefreshRate(this)
@@ -248,7 +272,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Thermal guard
-        switchThermal.setOnCheckedChangeListener { _, _ -> savePrefs() }
+        switchThermal.setOnCheckedChangeListener { _, _ ->
+            if (!restoringPrefs) savePrefs()
+        }
     }
 
     // ================================================================
@@ -256,16 +282,19 @@ class MainActivity : AppCompatActivity() {
     // ================================================================
 
     private fun detectDeviceInfo() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            val gpuInfo = detectGpuInfo()
-            val display = getDisplayInfo()
-
-            withContext(Dispatchers.Main) {
-                txtGpuName.text = gpuInfo.name
-                txtVulkanDriver.text = gpuInfo.driverVersion
-                txtRefreshRate.text = "${display.refreshRate.toInt()} Hz"
-                txtResolution.text = "${display.width} × ${display.height}"
+        lifecycleScope.launch {
+            val gpuInfo = withContext(Dispatchers.IO) {
+                withTimeoutOrNull(1_500L) { detectGpuInfo() }
+                    ?: GpuInfo("Unavailable", "System default", false, false)
             }
+
+            if (isFinishing || isDestroyed) return@launch
+
+            val display = getDisplayInfo()
+            txtGpuName.text = gpuInfo.name
+            txtVulkanDriver.text = gpuInfo.driverVersion
+            txtRefreshRate.text = "${display.refreshRate.toInt()} Hz"
+            txtResolution.text = "${display.width} × ${display.height}"
         }
     }
 
@@ -339,40 +368,43 @@ class MainActivity : AppCompatActivity() {
     // ================================================================
 
     private fun checkCompatibility() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            val gpu = detectGpuInfo()
-            val display = getDisplayInfo()
-            val hasShizuku = isShizukuAvailable()
+        compatibilityJob?.cancel()
+        compatibilityJob = lifecycleScope.launch {
+            // These probes talk to system services and must never delay the UI.
+            val gpu = withContext(Dispatchers.IO) {
+                withTimeoutOrNull(1_500L) { detectGpuInfo() }
+                    ?: GpuInfo("Unavailable", "System default", false, false)
+            }
+            val hasShizuku = withContext(Dispatchers.IO) {
+                withTimeoutOrNull(1_000L) { isShizukuAvailable() } ?: false
+            }
 
-            // Check Vulkan
+            if (isFinishing || isDestroyed) return@launch
+
+            val display = getDisplayInfo()
             val hasVulkan = File("/system/lib64/libvulkan.so").exists() ||
                     File("/system/lib/libvulkan.so").exists() ||
                     Build.VERSION.SDK_INT >= Build.VERSION_CODES.N
-
-            // Check GPU compat
             val gpuOk = gpu.isAdreno || gpu.isMali
-
-            // Check refresh rate (120Hz+)
             val refreshOk = display.refreshRate >= 90f
-
             val allOk = hasVulkan && gpuOk && refreshOk && hasShizuku
 
-            withContext(Dispatchers.Main) {
-                setCheckItem(checkVulkan, "Vulkan Support", hasVulkan)
-                setCheckItem(checkGpu, "GPU: ${gpu.name}", gpuOk)
-                setCheckItem(checkRefresh, "${display.refreshRate.toInt()}Hz Display", refreshOk)
-                setCheckItem(checkShizuku, "Shizuku / ADB", hasShizuku)
+            setCheckItem(checkVulkan, "Vulkan Support", hasVulkan)
+            setCheckItem(checkGpu, "GPU: ${gpu.name}", gpuOk)
+            setCheckItem(checkRefresh, "${display.refreshRate.toInt()}Hz Display", refreshOk)
+            setCheckItem(checkShizuku, "Shizuku / ADB", hasShizuku)
 
-                txtCompatStatus.text = when {
-                    allOk -> "Device is compatible ✓"
-                    !hasVulkan -> "Vulkan not detected. Frame generation requires Vulkan."
-                    !gpuOk -> "GPU may not be fully compatible. Adreno 6xx+ or Mali Valhall recommended."
-                    !refreshOk -> "Low refresh rate display. 120Hz+ recommended for best results."
-                    !hasShizuku -> "Shizuku not running. Install Shizuku and activate via ADB."
-                    else -> "Some compatibility issues detected."
-                }
-                txtCompatStatus.setTextColor(if (allOk) Color.parseColor("#4CAF50") else Color.parseColor("#FF9800"))
+            txtCompatStatus.text = when {
+                allOk -> "Device is compatible ✓"
+                !hasVulkan -> "Vulkan not detected. Frame generation requires Vulkan."
+                !gpuOk -> "GPU may not be fully compatible. Adreno 6xx+ or Mali Valhall recommended."
+                !refreshOk -> "Low refresh rate display. 120Hz+ recommended for best results."
+                !hasShizuku -> "Shizuku not running or not authorized yet."
+                else -> "Some compatibility issues detected."
             }
+            txtCompatStatus.setTextColor(
+                if (allOk) Color.parseColor("#4CAF50") else Color.parseColor("#FF9800")
+            )
         }
     }
 
@@ -385,15 +417,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun isShizukuAvailable(): Boolean {
         return try {
-            rikka.shizuku.Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-        } catch (_: Exception) {
-            // Check if Shizuku is at least installed
-            try {
-                packageManager.getPackageInfo("moe.shizuku.privileged.api", 0)
-                false // Installed but not running/permitted
-            } catch (_: Exception) {
-                false
-            }
+            rikka.shizuku.Shizuku.pingBinder() &&
+                rikka.shizuku.Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        } catch (e: Exception) {
+            Log.w(TAG, "Shizuku is not ready", e)
+            false
         }
     }
 
@@ -625,26 +653,30 @@ class MainActivity : AppCompatActivity() {
 
     private fun loadPrefs() {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        selectedPackage = prefs.getString("selectedPackage", null)
-        selectedAppName = prefs.getString("selectedAppName", null)
+        restoringPrefs = true
+        try {
+            selectedPackage = prefs.getString("selectedPackage", null)
+            selectedAppName = prefs.getString("selectedAppName", null)
 
-        if (selectedPackage != null) {
-            txtSelectedGame.text = selectedAppName ?: selectedPackage
-            txtSelectedGame.setTextColor(Color.parseColor("#CCCCCC"))
-            txtGameInfo.text = selectedPackage
-            txtGameInfo.visibility = View.VISIBLE
+            if (selectedPackage != null) {
+                txtSelectedGame.text = selectedAppName ?: selectedPackage
+                txtSelectedGame.setTextColor(Color.parseColor("#CCCCCC"))
+                txtGameInfo.text = selectedPackage
+                txtGameInfo.visibility = View.VISIBLE
+            }
+
+            seekTargetFps.progress = prefs.getInt("targetFps", 120)
+            txtTargetFps.text = seekTargetFps.progress.toString()
+            seekQuality.progress = prefs.getInt("quality", 75)
+            spinnerMethod.setSelection(prefs.getInt("method", 0))
+            spinnerMode.setSelection(prefs.getInt("mode", 0))
+
+            // Display-mode changes only happen after an explicit tap, never on launch.
+            switchForceRefresh.isChecked = false
+            switchThermal.isChecked = prefs.getBoolean("thermal", true)
+        } finally {
+            restoringPrefs = false
         }
-
-        seekTargetFps.progress = prefs.getInt("targetFps", 120)
-        txtTargetFps.text = seekTargetFps.progress.toString()
-
-        seekQuality.progress = prefs.getInt("quality", 75)
-
-        spinnerMethod.setSelection(prefs.getInt("method", 0))
-        spinnerMode.setSelection(prefs.getInt("mode", 0))
-
-        switchForceRefresh.isChecked = prefs.getBoolean("forceRefresh", false)
-        switchThermal.isChecked = prefs.getBoolean("thermal", true)
     }
 
     // ================================================================
